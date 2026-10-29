@@ -388,7 +388,7 @@ def update_transaction(
         E (date_local em America/Sao_Paulo), então atualiza.
     Retorna: status, rows_affected, id, e o registro atualizado.
     """
-    if not any([amount, type_id, type_name, category_id, category_name, description, payment_method, occurred_at]):
+    if not any(valor is not None for valor in [amount, type_id, type_name, category_id, category_name, description, payment_method, occurred_at]):
         return {"status": "error", "message": "Nada para atualizar: forneça pelo menos um campo (amount, type, category, description, payment_method, occurred_at)."}
 
     conn = get_conn()
@@ -512,3 +512,6 @@ TOOLS = [
     daily_balance,
     update_transaction,
 ]
+
+# Apenas consultas são expostas ao modelo; escritas pertencem ao executor.
+TOOLS_LEITURA = [query_transactions, total_balance, daily_balance]

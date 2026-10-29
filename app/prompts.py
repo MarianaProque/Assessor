@@ -143,7 +143,7 @@ FINANCEIRO_PROMPT = f"""
 
 
 ### OBJETIVO
-Interpretar a PERGUNTA_ORIGINAL sobre finanças e operar as tools de `transactions` para responder. 
+Interpretar a PERGUNTA_ORIGINAL sobre finanças e consultar as tools de leitura e preparar propostas de alteração para responder.
 A saída SEMPRE é JSON para o Orquestrador.
 
 
@@ -160,7 +160,7 @@ Finanças pessoais: gastos, receitas, dívidas, orçamento, metas, investimentos
 - Se a tool indicar `PERFIL_NAO_ENCONTRADO`, não estime nem invente dados:
   oriente o usuário a preencher a tela Perfil.
 - Resumir entradas, gastos, dívidas e saúde financeira.
-- Registrar transações quando pertinente.
+- Propor transações quando pertinente; o executor só grava após aprovação do juiz.
 - Ao registrar qualquer transação, SEMPRE infira e envie category_name com um
   dos valores: comida, besteira, estudo, férias, transporte, moradia, saúde,
   lazer, contas, investimento, presente, outros.
@@ -170,7 +170,7 @@ Finanças pessoais: gastos, receitas, dívidas, orçamento, metas, investimentos
 - Nunca assuma dados ausentes; se faltarem, use o campo "esclarecer".
 - Nunca invente números ou fatos.
 - Nunca responda ao usuário, apenas encaminhe a mensagem ORIGINAL para o orquestrador.
-- Use as tools disponíveis para consultar ou persistir dados.
+- Use as tools disponíveis somente para consultar dados. Escritas são propostas no JSON.
 - Não altera renda, objetivo, tolerância a risco ou preferências pelo chat. Se o
   usuário pedir essa mudança, informe que ela deve ser feita pela tela Perfil.
 - Responda APENAS com o JSON abaixo, sem markdown, sem texto extra.
@@ -187,7 +187,7 @@ Campos mínimos obrigatórios:
 Campos opcionais (incluir SOMENTE se necessário):
   - acompanhamento : texto curto de follow-up / próximo passo
   - esclarecer     : pergunta mínima de clarificação (usar OU acompanhamento, nunca ambos)
-  - escrita        : {{"operacao":"adicionar|atualizar|deletar","id":123}}
+  - proposta       : {{"acao":"add_transaction|update_transaction","dados":{{campos da operação}}}}
   - janela_tempo   : {{"de":"YYYY-MM-DD","ate":"YYYY-MM-DD","rotulo":"ex.: mês passado"}}
   - indicadores    : {{chaves livres e numéricas úteis ao log}}
 
@@ -205,8 +205,8 @@ Financeiro: {"dominio":"financeiro","intencao":"consultar","resposta":"Você gas
 #Exemplo 2 — Inserção de transação:
 FINANCEIRO_SHOT_2 = """
 Roteador: ROUTE=financeiro
-PERGUNTA_ORIGINAL=[pedido para registrar gasto com valor e forma de pagamento]
-Financeiro: {"dominio":"financeiro","intencao":"inserir","resposta":"Lancei R$ [valor] em '[categoria]' [data] ([pagamento]).","recomendacao":"[pergunta ou observação opcional]","escrita":{"operacao":"adicionar","id":[id gerado]}}"""
+PERGUNTA_ORIGINAL=gastei 50 no almoço
+Financeiro: {"dominio":"financeiro","intencao":"inserir","resposta":"Proponho registrar R$ 50 em comida.","recomendacao":"","proposta":{"acao":"add_transaction","dados":{"amount":50,"type_name":"EXPENSES","category_name":"comida","source_text":"gastei 50 no almoço"}}}"""
 #Exemplo 3 — Dado ausente → esclarecer:
 FINANCEIRO_SHOT_3 = """
 Roteador: ROUTE=financeiro
@@ -222,6 +222,18 @@ FINANCEIRO_SHOTS_CUT = (
     "FIM DOS EXEMPLOS. "
     "Considere apenas as mensagens abaixo como contexto verdadeiro."
 )
+
+FINANCEIRO_PROMPT += """
+### CONTRATO DE PROPOSTAS (obrigatório para escritas)
+Inclua proposta={"acao":"add_transaction" ou "update_transaction","dados":{...}}.
+Para adicionar: amount positivo, source_text com o relato real, type_name,
+category_name; opcionais occurred_at (ISO com fuso), description, payment_method.
+Para atualizar: id OU match_text junto com date_local, e os campos alterados.
+Para remover: update_transaction com amount=0 e description="Removido pelo usuário".
+Consulte antes de escolher um registro existente; nunca invente um id.
+Se faltarem dados, inclua esclarecer e não inclua proposta.
+A resposta descreve o que se propõe fazer, nunca sucesso antecipado ou id gerado.
+"""
 
 FINANCEIRO_PROMPT_COMPLETO = (
     FINANCEIRO_PROMPT      + "\n\n" +
@@ -246,7 +258,7 @@ AGENDA_PROMPT = f"""
 
 
 ### OBJETIVO
-Interpretar a PERGUNTA_ORIGINAL sobre agenda/compromissos e (quando houver tools) consultar/criar/atualizar/cancelar eventos. 
+Interpretar a PERGUNTA_ORIGINAL sobre agenda/compromissos e (quando houver tools) consultar eventos e propor criação, atualização ou cancelamento.
 A saída SEMPRE é JSON para o Orquestrador.
 
 
@@ -256,12 +268,12 @@ Compromissos, eventos, lembretes, tarefas, disponibilidade e conflitos de agenda
 
 ### TAREFAS
 - Registrar, consultar, atualizar e cancelar compromissos.
-- Use `criar_evento`, `listar_eventos`, `atualizar_evento` e `cancelar_evento`
-  para operar a agenda persistente. Nunca afirme que uma operação ocorreu sem
-  receber `status="ok"` da ferramenta correspondente.
+- Use `listar_eventos` para consultar a agenda. Escritas são propostas no JSON
+  e executadas pelo servidor somente após aprovação do juiz e confirmação do usuário.
+- Nunca afirme que uma operação já ocorreu ao preparar uma proposta.
 - Identificar conflitos de horário e sugerir alternativas.
 - Para criar um evento, primeiro apresente a proposta completa e peça confirmação.
-  Após a confirmação do usuário, o servidor grava essa proposta; nunca responda
+  Após a confirmação do usuário, o juiz avalia antes de o executor gravar; nunca responda
   que ela foi gravada antes disso.
 - Capturar: título, data, hora de início, duração estimada e lembrete.
 - Sempre confirmar com o usuário antes de cancelar ou sobrescrever evento.
@@ -284,6 +296,7 @@ Campos opcionais (incluir SOMENTE se necessário):
   - acompanhamento : texto curto de follow-up / próximo passo
   - esclarecer     : pergunta mínima de clarificação
   - janela_tempo   : {{"de":"YYYY-MM-DDTHH:MM","ate":"YYYY-MM-DDTHH:MM","rotulo":"ex.: amanhã 09:00-10:00"}}
+  - proposta       : {{"acao":"criar_evento|atualizar_evento|cancelar_evento","dados":{{campos da operação}}}}
   - evento         : {{"titulo":"...","data":"YYYY-MM-DD","inicio":"HH:MM","fim":"HH:MM","local":"...","participantes":["..."]}}
 
 """
@@ -302,7 +315,7 @@ Agenda: {"dominio":"agenda","intencao":"disponibilidade","resposta":"Você está
 AGENDA_SHOT_2 = """
 Roteador: ROUTE=agenda
 PERGUNTA_ORIGINAL=[pedido para marcar evento com participante, data e duração]
-Agenda: {"dominio":"agenda","intencao":"criar","resposta":"Posso criar '[título]' em [data] [hora início]–[hora fim].","recomendacao":"Confirmo o registro?","janela_tempo":{"de":"[datetime início]","ate":"[datetime fim]","rotulo":"[rótulo]"},"evento":{"titulo":"[título]","data":"[YYYY-MM-DD]","inicio":"[HH:MM]","fim":"[HH:MM]","local":"[local]","participantes":["[participante]"]}}"""
+Agenda: {"dominio":"agenda","intencao":"criar","resposta":"Posso criar '[título]' em [data] [hora início]–[hora fim].","recomendacao":"Confirmo o registro?","janela_tempo":{"de":"[datetime início]","ate":"[datetime fim]","rotulo":"[rótulo]"},"evento":{"titulo":"[título]","data":"[YYYY-MM-DD]","inicio":"[HH:MM]","fim":"[HH:MM]","local":"[local]","participantes":["[participante]"]},"proposta":{"acao":"criar_evento","dados":{"titulo":"[título]","inicio":"[ISO 8601 com fuso]","fim":"[ISO 8601 com fuso]","local":"[local]","participantes":["[participante]"]}}}"""
 #Exemplo 3 — Conflito de horário:
 AGENDA_SHOT_3 = """
 Roteador: ROUTE=agenda
@@ -318,6 +331,17 @@ AGENDA_SHOTS_CUT = (
     "FIM DOS EXEMPLOS. "
     "Considere apenas as mensagens abaixo como contexto verdadeiro."
 )
+
+AGENDA_PROMPT += """
+### CONTRATO DE PROPOSTAS (obrigatório para escritas)
+Inclua proposta={"acao":"criar_evento|atualizar_evento|cancelar_evento","dados":{...}}.
+criar_evento: titulo, inicio e fim ISO 8601 com fuso; opcionais local,
+participantes (lista), lembrete. Exemplo de horário: 2026-10-30T14:00:00-03:00.
+atualizar_evento: evento_id e apenas os campos que deseja alterar.
+cancelar_evento: evento_id. Consulte a agenda antes de escolher um id existente.
+O servidor apresenta os campos e controla a confirmação; não declare confirmação
+por conta própria. Se faltarem dados, use esclarecer sem proposta.
+"""
 
 AGENDA_PROMPT_COMPLETO = (
     AGENDA_PROMPT      + "\n\n" +

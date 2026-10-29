@@ -22,20 +22,21 @@ from app.prompts import (
     ORQUESTRADOR_PROMPT_COMPLETO,
     ROUTER_PROMPT_COMPLETO,
 )
-from app.tools.financeiro import TOOLS
-from app.tools.agenda import TOOLS_AGENDA, criar_evento
+from app.tools.financeiro import TOOLS_LEITURA
+from app.tools.agenda import TOOLS_AGENDA_LEITURA
 from app.tools.faq import faq_retriever
 from app.tools.memoria import TOOLS_MEMORIA
 from app.tools.perfil import TOOLS_PERFIL, consultar_perfil_financeiro
 from app.juiz import no_juiz
+from app.executor import executar_operacao, validar_proposta
 
 router_agent = create_agent(model=llm_rapido, system_prompt=ROUTER_PROMPT_COMPLETO, tools=TOOLS_MEMORIA)
 financeiro_agent = create_agent(
     model=llm, system_prompt=FINANCEIRO_PROMPT_COMPLETO,
-    tools=TOOLS + TOOLS_MEMORIA + TOOLS_PERFIL,
+    tools=TOOLS_LEITURA + TOOLS_MEMORIA + TOOLS_PERFIL,
 )
 agenda_agent = create_agent(
-    model=llm, system_prompt=AGENDA_PROMPT_COMPLETO, tools=TOOLS_AGENDA + TOOLS_MEMORIA
+    model=llm, system_prompt=AGENDA_PROMPT_COMPLETO, tools=TOOLS_AGENDA_LEITURA + TOOLS_MEMORIA
 )
 orquestrador_agent = create_agent(
     model=llm_rapido, system_prompt=ORQUESTRADOR_PROMPT_COMPLETO
@@ -52,6 +53,13 @@ class Estado(MessagesState):
     rota: str
     mapa_pii: dict[str, str]
     bloqueado: bool
+    proposta: dict | None
+    avaliacao: dict | None
+    resultado_execucao: dict | None
+    evidencias: list[str]
+    proposta_pendente: dict | None
+    confirmada: bool
+    erro_proposta: bool
 
 
 def _texto_mensagem(mensagem: object) -> str:
@@ -60,15 +68,18 @@ def _texto_mensagem(mensagem: object) -> str:
 
 
 def no_guardrail_entrada(estado: Estado) -> dict:
-    texto, mapa_pii = anonimizar_entrada(_texto_mensagem(estado["messages"][-1]))
+    pergunta = _texto_mensagem(estado["messages"][-1])
+    texto, mapa_pii = anonimizar_entrada(pergunta)
+    pendente = estado.get("proposta_pendente") if _confirmacao_explicita(pergunta) else None
     resultado = guardrail_entrada(texto)
     if resultado["bloqueado"]:
         return {
             "bloqueado": True,
+            "proposta_pendente": None,
             "mapa_pii": mapa_pii,
             "messages": [AIMessage(content=resultado["mensagem"])],
         }
-    return {"bloqueado": False, "mapa_pii": mapa_pii}
+    return {"bloqueado": False, "mapa_pii": mapa_pii, "proposta_pendente": pendente}
 
 
 def decidir_pos_guardrail_entrada(estado: Estado) -> str:
@@ -76,6 +87,8 @@ def decidir_pos_guardrail_entrada(estado: Estado) -> str:
 
 
 def no_roteador(estado: Estado, config) -> dict:
+    if estado.get("proposta_pendente") and _confirmacao_explicita(_texto_mensagem(estado["messages"][-1])):
+        return {"agentes_chamados": ["roteador"], "rota": "agenda"}
     saida = router_agent.invoke({"messages": list(estado["messages"])}, config=config)
     texto = _texto_mensagem(saida["messages"][-1])
     if not texto.strip().startswith("ROUTE="):
@@ -104,7 +117,7 @@ def no_financeiro(estado: Estado, config) -> dict:
         "fluxo normal."
     )), *mensagens]
     saida = financeiro_agent.invoke({"messages": mensagens}, config=config)
-    return {"agentes_chamados": ["financeiro"], "messages": [saida["messages"][-1]]}
+    return _saida_especialista("financeiro", saida, len(mensagens), estado, [f"[perfil] {perfil}"])
 
 
 def _json_da_mensagem(mensagem: object) -> dict | None:
@@ -119,84 +132,94 @@ def _json_da_mensagem(mensagem: object) -> dict | None:
     return valor if isinstance(valor, dict) else None
 
 
-def _proposta_pendente_de_evento(mensagens: list[object]) -> dict | None:
-    """Localiza a última proposta de criação que ainda aguarda confirmação."""
-    for mensagem in reversed(mensagens):
-        proposta = _json_da_mensagem(mensagem)
-        if not proposta or proposta.get("dominio") != "agenda":
-            continue
-        if proposta.get("intencao") != "criar":
-            continue
-        if "confirm" not in str(proposta.get("recomendacao", "")).lower():
-            continue
-        evento = proposta.get("evento")
-        if isinstance(evento, dict) and all(
-            evento.get(campo) for campo in ("titulo", "data", "inicio", "fim")
-        ):
-            return evento
-    return None
-
-
-def _confirmacao_de_criacao(texto: str) -> bool:
-    return bool(re.match(
-        r"^\s*(sim|confirmo|pode confirmar|pode criar|pode agendar|confirmar)\b",
-        texto,
-        flags=re.IGNORECASE,
+def _confirmacao_explicita(texto: str) -> bool:
+    # A confirmação deve ser uma resposta inteira, não "sim, mas mude...".
+    return bool(re.fullmatch(
+        r"\s*(sim|confirmo|pode confirmar|pode criar|pode agendar|confirmar|pode cancelar|pode atualizar)[.!]?\s*",
+        texto, flags=re.IGNORECASE,
     ))
 
 
-def _data_hora_iso(data: str, hora: str) -> str:
-    """Converte os campos do contrato do agente em timestamp ISO para a tool."""
-    if "T" in hora:
-        return hora
-    hora_completa = hora if hora.count(":") >= 2 else f"{hora}:00"
-    return f"{data}T{hora_completa}-03:00"
-
-
-def _resultado_criacao_evento(evento: dict, config) -> AIMessage:
-    """Persiste a proposta confirmada e gera resposta a partir do retorno da tool."""
-    resultado = criar_evento.invoke({
-        "titulo": evento["titulo"],
-        "inicio": _data_hora_iso(evento["data"], evento["inicio"]),
-        "fim": _data_hora_iso(evento["data"], evento["fim"]),
-        "local": evento.get("local"),
-        "participantes": evento.get("participantes") or [],
-        "lembrete": evento.get("lembrete"),
-    }, config=config)
-    if resultado.get("status") == "ok":
-        resposta = (
-            f"Evento '{evento['titulo']}' agendado para {evento['data']} "
-            f"às {evento['inicio']}."
-        )
-        recomendacao = ""
-    else:
-        resposta = resultado.get("message", "Não foi possível gravar o evento.")
-        recomendacao = "Ajuste o horário ou os dados e tente novamente."
-    return AIMessage(content=json.dumps({
-        "dominio": "agenda",
-        "intencao": "criar",
-        "resposta": resposta,
-        "recomendacao": recomendacao,
-    }, ensure_ascii=False))
+def _saida_especialista(nome, saida, inicio, estado, evidencias=None):
+    novas = saida["messages"][inicio:]
+    provas = list(estado.get("evidencias") or []) + list(evidencias or [])
+    provas.extend(f"[{getattr(m, 'name', 'tool')}] {_texto_mensagem(m)}"
+                  for m in novas if getattr(m, "type", "") == "tool")
+    ultima = saida["messages"][-1]
+    contrato = _json_da_mensagem(ultima) or {}
+    proposta = None
+    erro = False
+    escrita = contrato.get("proposta")
+    intencao_escrita = contrato.get("intencao") in {
+        "inserir", "atualizar", "deletar", "criar", "cancelar"
+    }
+    if escrita is not None:
+        try:
+            proposta = validar_proposta(escrita).model_dump()
+            financeiro = proposta["acao"] in {"add_transaction", "update_transaction"}
+            if nome not in {"financeiro", "agenda"} or financeiro != (nome == "financeiro") or contrato.get("esclarecer"):
+                raise ValueError("Proposta incompatível.")
+        except (ValueError, TypeError, KeyError):
+            proposta = None
+            erro = True
+    elif intencao_escrita and not contrato.get("esclarecer"):
+        erro = True
+    return {
+        "agentes_chamados": [nome], "messages": [ultima],
+        "evidencias": provas, "proposta": proposta,
+        "erro_proposta": erro, "confirmada": False,
+        "proposta_pendente": None,
+    }
 
 
 def no_agenda(estado: Estado, config) -> dict:
     mensagens = list(estado["messages"])
     pergunta = _texto_mensagem(mensagens[-1])
-    proposta = _proposta_pendente_de_evento(mensagens[:-1])
-    if proposta and _confirmacao_de_criacao(pergunta):
+    pendente = estado.get("proposta_pendente")
+    if pendente and _confirmacao_explicita(pergunta):
         return {
-            "agentes_chamados": ["agenda"],
-            "messages": [_resultado_criacao_evento(proposta, config)],
+            "agentes_chamados": ["agenda"], "proposta": pendente,
+            "confirmada": True, "proposta_pendente": None,
+            "evidencias": ["[proposta apresentada e confirmada pelo usuário] " + json.dumps(pendente, ensure_ascii=False)],
+            "messages": [AIMessage(content="Proposta confirmada pelo usuário; aguardando avaliação para executar.")],
         }
-
     saida = agenda_agent.invoke({"messages": mensagens}, config=config)
-    return {"agentes_chamados": ["agenda"], "messages": [saida["messages"][-1]]}
+    return _saida_especialista("agenda", saida, len(mensagens), estado)
+
+
+def decidir_pos_juiz(estado: Estado) -> str:
+    avaliacao = estado.get("avaliacao") or {}
+    if not avaliacao.get("aprovado") or not estado.get("proposta"):
+        return "fim"
+    if estado["proposta"]["acao"] in {"criar_evento", "atualizar_evento", "cancelar_evento"} and not estado.get("confirmada"):
+        return "confirmacao"
+    return "executor"
+
+
+def no_aguardar_confirmacao(estado: Estado) -> dict:
+    proposta = estado["proposta"]
+    rotulos = {"titulo": "Título", "inicio": "Início", "fim": "Fim",
+               "local": "Local", "participantes": "Participantes", "lembrete": "Lembrete",
+               "evento_id": "Código do evento"}
+    verbos = {"criar_evento": "criar evento", "atualizar_evento": "atualizar evento",
+              "cancelar_evento": "cancelar evento"}
+    resumo = "\n".join(f"{rotulos[campo]}: {', '.join(valor) if isinstance(valor, list) else valor}"
+                       for campo, valor in proposta["dados"].items() if valor is not None)
+    return {"proposta_pendente": proposta,
+            "messages": [AIMessage(content=f"Posso {verbos[proposta['acao']]} com estes dados:\n{resumo}\nConfirma essa operação?")]}
+
+
+def no_executor(estado: Estado, config) -> dict:
+    resultado = executar_operacao(estado["proposta"], estado.get("avaliacao") or {},
+                                 config, confirmada=estado.get("confirmada", False))
+    return {"agentes_chamados": ["executor"],
+            "resultado_execucao": resultado.model_dump(), "proposta_pendente": None,
+            "messages": [AIMessage(content=resultado.mensagem)]}
 
 
 def no_faq(estado: Estado, config) -> dict:
     saida = faq_agent.invoke({"messages": list(estado["messages"])}, config=config)
-    return {"agentes_chamados": ["faq"], "messages": [saida["messages"][-1]]}
+    return _saida_especialista("faq", saida, len(estado["messages"]), estado)
 
 
 def no_orquestrador(estado: Estado, config: RunnableConfig) -> dict:
@@ -238,6 +261,8 @@ grafo.add_node("faq", no_faq)
 grafo.add_node("orquestrador", no_orquestrador)
 grafo.add_node("guardrail_saida", no_guardrail_saida)
 grafo.add_node("juiz", no_juiz)
+grafo.add_node("executor", no_executor)
+grafo.add_node("confirmacao", no_aguardar_confirmacao)
 
 grafo.set_entry_point("guardrail_entrada")
 grafo.add_conditional_edges("guardrail_entrada", decidir_pos_guardrail_entrada, {"roteador": "roteador", "fim": END})
@@ -248,7 +273,10 @@ grafo.add_edge("agenda",          "orquestrador")
 grafo.add_edge("orquestrador",    "guardrail_saida")
 grafo.add_edge("guardrail_saida", "juiz")
 grafo.add_edge("faq",             "juiz")
-grafo.add_edge("juiz",            END)
+grafo.add_conditional_edges("juiz", decidir_pos_juiz,
+                            {"executor": "executor", "confirmacao": "confirmacao", "fim": END})
+grafo.add_edge("executor", END)
+grafo.add_edge("confirmacao", END)
 
 fluxo_agentes = grafo.compile(checkpointer=MemorySaver())
 
@@ -263,6 +291,12 @@ def executar_fluxo_assessor(
         "rota":             "",
         "mapa_pii":         {},
         "session_id":       session_id,
+        "proposta": None,
+        "avaliacao": None,
+        "resultado_execucao": None,
+        "evidencias": [],
+        "confirmada": False,
+        "erro_proposta": False,
 
     }
 

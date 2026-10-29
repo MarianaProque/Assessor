@@ -175,3 +175,5 @@ def cancelar_evento(evento_id: str, config: RunnableConfig) -> dict:
 
 
 TOOLS_AGENDA = [criar_evento, listar_eventos, atualizar_evento, cancelar_evento]
+
+TOOLS_AGENDA_LEITURA = [listar_eventos]

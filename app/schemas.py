@@ -1,6 +1,28 @@
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+class PropostaOperacao(BaseModel):
+    """Comando preparado pelo especialista; ainda não foi executado."""
+
+    model_config = ConfigDict(extra="forbid")
+    acao: Literal["add_transaction", "update_transaction", "criar_evento",
+                  "atualizar_evento", "cancelar_evento"]
+    dados: dict
+
+
+class AvaliacaoJuiz(BaseModel):
+    aprovado: bool = False
+    motivo: str
+    pontuacao: float | None = Field(default=None, ge=0, le=1)
+    proposta: PropostaOperacao | None = None
+
+
+class ResultadoExecucao(BaseModel):
+    status: Literal["ok", "error", "conflict"]
+    mensagem: str
+    registro_id: str | int | None = None
 
 class ChatRequest(BaseModel):
     """O que o navegador envia no POST /chat."""

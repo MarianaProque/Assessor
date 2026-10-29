@@ -1,5 +1,5 @@
 """
-Juiz de fidelidade. Na ordem desta aula ele fala por último.
+Juiz de fidelidade: aprova a proposta antes de qualquer execução.
 Quem decide é o JEV: choice e noul, sem redação.
 A frase fixa, quando entra, é deste arquivo.
 """
@@ -8,6 +8,8 @@ import urllib.error
 import urllib.request
 
 from app.config import TYPESAFE_API_KEY
+from app.schemas import AvaliacaoJuiz
+from app.executor import validar_proposta
 
 JEV_URL = "https://api.typesafe.ai/v1/systemone"
 JEV_MODELO = "jev-latest"
@@ -57,25 +59,24 @@ def _coleta(estado):
             nome = getattr(mensagem, "name", "") or "tool"
             evidencias.append(f"[{nome}]\n{texto}")
         elif tipo == "ai":
-            for chamada in getattr(mensagem, "tool_calls", None) or []:
-                argumentos = json.dumps(chamada.get("args", {}), ensure_ascii=False)
-                evidencias.append(f"[chamada {chamada.get('name')}]\n{argumentos}")
             if texto:
                 resposta = texto
+    evidencias.extend(estado.get("evidencias") or [])
     evidencia = "\n\n".join(evidencias).strip()
     if not evidencia:
         evidencia = "(nenhuma tool devolveu conteúdo neste turno)"
     return pergunta, resposta, evidencia[-6000:]
 
 
-def _publicar(texto, rotulo, resposta_original):
+def _publicar(texto, rotulo, resposta_original, *, aprovado=False, pontuacao=None):
     print(f"[juiz] {rotulo}")
-    if texto.strip() == (resposta_original or "").strip():
-        return {"agentes_chamados": [f"juiz:{rotulo}"]}
-    return {
-        "messages": [{"role": "assistant", "content": texto.strip()}],
+    resultado = {
         "agentes_chamados": [f"juiz:{rotulo}"],
+        "avaliacao": AvaliacaoJuiz(aprovado=aprovado, motivo=rotulo, pontuacao=pontuacao).model_dump(),
     }
+    if texto.strip() != (resposta_original or "").strip():
+        resultado["messages"] = [{"role": "assistant", "content": texto.strip()}]
+    return resultado
 
 
 def _julgar_jev(pergunta, resposta, evidencia):
@@ -125,18 +126,39 @@ def _julgar_jev(pergunta, resposta, evidencia):
     respostas = dados["answers"]
     choice = respostas["veredito"]["choice"]
     noul = float(respostas["apoiada"]["noul"])
-    if choice == "apoiada" and noul >= LIMIAR:
-        return _publicar(resposta, f"apoiada noul={noul:.2f}", resposta)
+    if choice == "apoiada" and LIMIAR <= noul <= 1:
+        return _publicar(resposta, f"apoiada noul={noul:.2f}", resposta, aprovado=True, pontuacao=noul)
     rotulo = "apoiada:abaixo_do_limiar" if choice == "apoiada" else choice
     return _publicar(FRASE_SEGURA, f"{rotulo} noul={noul:.2f}", resposta)
 
 
 def no_juiz(estado: dict) -> dict:
     pergunta, resposta, evidencia = _coleta(estado)
+    proposta = estado.get("proposta")
+    if estado.get("erro_proposta"):
+        return {**_publicar("Não foi possível validar os dados da operação. Pode esclarecer o pedido?", "proposta_invalida", resposta), "proposta_pendente": None}
     if not resposta:
-        return {"agentes_chamados": ["juiz:sem_resposta"]}
+        return _publicar(FRASE_SEGURA, "sem_resposta", resposta)
     try:
-        return _julgar_jev(pergunta, resposta, evidencia)
+        if proposta:
+            proposta = validar_proposta(proposta).model_dump()
+            # O comando é objeto de julgamento, nunca evidência da própria correção.
+            resposta_avaliada = json.dumps({"resposta": resposta, "operacao_proposta": proposta}, ensure_ascii=False)
+            evidencia += ("\nA operação ainda NÃO foi executada. Avalie se cada campo e a ação "
+                          "correspondem ao pedido do usuário; categorias podem ser inferidas do relato. "
+                          "Uma proposta não é prova de que a gravação ocorreu.")
+        else:
+            resposta_avaliada = resposta
+        resultado = _julgar_jev(pergunta, resposta_avaliada, evidencia)
+        avaliacao = AvaliacaoJuiz.model_validate(resultado["avaliacao"]).model_dump()
+        resultado["avaliacao"] = avaliacao
+        if avaliacao["aprovado"]:
+            avaliacao["proposta"] = proposta
+        elif proposta:
+            resultado["proposta_pendente"] = None
+        return resultado
     except Exception as exc:
-        print(f"[juiz] erro {exc}")
-        return _publicar(FRASE_SEGURA, "erro", resposta)
+        print(f"[juiz] erro {type(exc).__name__}")
+        resultado = _publicar(FRASE_SEGURA, "erro", resposta)
+        resultado["proposta_pendente"] = None
+        return resultado
