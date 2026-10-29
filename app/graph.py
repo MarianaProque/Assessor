@@ -29,6 +29,8 @@ from app.tools.memoria import TOOLS_MEMORIA
 from app.tools.perfil import TOOLS_PERFIL, consultar_perfil_financeiro
 from app.juiz import no_juiz
 from app.executor import executar_operacao, validar_proposta
+from app.schemas import ResultadoExecucao
+from app.saida import texto_publico
 
 router_agent = create_agent(model=llm_rapido, system_prompt=ROUTER_PROMPT_COMPLETO, tools=TOOLS_MEMORIA)
 financeiro_agent = create_agent(
@@ -64,7 +66,19 @@ class Estado(MessagesState):
 
 def _texto_mensagem(mensagem: object) -> str:
     conteudo = getattr(mensagem, "content", mensagem)
-    return conteudo if isinstance(conteudo, str) else str(conteudo)
+    if isinstance(conteudo, str):
+        return conteudo
+    if isinstance(conteudo, list):
+        # Gemini pode devolver blocos de conteúdo em vez de uma string.
+        # str(lista) produz representação Python e destrói o contrato JSON.
+        partes = []
+        for bloco in conteudo:
+            if isinstance(bloco, str):
+                partes.append(bloco)
+            elif isinstance(bloco, dict) and isinstance(bloco.get("text"), str):
+                partes.append(bloco["text"])
+        return "".join(partes)
+    return str(conteudo)
 
 
 def no_guardrail_entrada(estado: Estado) -> dict:
@@ -146,9 +160,10 @@ def _saida_especialista(nome, saida, inicio, estado, evidencias=None):
     provas.extend(f"[{getattr(m, 'name', 'tool')}] {_texto_mensagem(m)}"
                   for m in novas if getattr(m, "type", "") == "tool")
     ultima = saida["messages"][-1]
-    contrato = _json_da_mensagem(ultima) or {}
+    contrato = _json_da_mensagem(ultima)
+    erro = contrato is None and nome in {"financeiro", "agenda"}
+    contrato = contrato or {}
     proposta = None
-    erro = False
     escrita = contrato.get("proposta")
     intencao_escrita = contrato.get("intencao") in {
         "inserir", "atualizar", "deletar", "criar", "cancelar"
@@ -223,6 +238,10 @@ def no_faq(estado: Estado, config) -> dict:
 
 
 def no_orquestrador(estado: Estado, config: RunnableConfig) -> dict:
+    if estado.get("proposta") or estado.get("erro_proposta"):
+        # Uma alegação do especialista de que já gravou nunca vira resposta pública.
+        return {"agentes_chamados": ["orquestrador"],
+                "messages": [AIMessage(content="Operação proposta; ainda não executada.")]}
     # Pega a última resposta do especialista (última AIMessage com conteúdo)
     ultima_especialista = ""
     for mensagem in reversed(estado["messages"]):
@@ -237,7 +256,7 @@ def no_orquestrador(estado: Estado, config: RunnableConfig) -> dict:
 
     return {
         "agentes_chamados": ["orquestrador"],
-        "messages":        [{"role": "assistant", "content": saida["messages"][-1].text}]
+        "messages":        [{"role": "assistant", "content": texto_publico(_texto_mensagem(saida["messages"][-1]))}]
     }
 
 
@@ -246,6 +265,27 @@ def no_guardrail_saida(estado: Estado) -> dict:
         _texto_mensagem(estado["messages"][-1]), estado.get("mapa_pii", {})
     )
     return {"messages": [AIMessage(content=resultado["conteudo"])]}
+
+
+def no_finalizar_resposta(estado: Estado) -> dict:
+    """Último nó em todos os caminhos: o modelo não decide o sucesso da escrita."""
+    resultado = estado.get("resultado_execucao")
+    avaliacao = estado.get("avaliacao") or {}
+    if resultado is not None:
+        execucao = ResultadoExecucao.model_validate(resultado)
+        # Mensagem produzida pelo executor a partir do retorno da ferramenta.
+        resposta = execucao.mensagem
+    elif estado.get("erro_proposta"):
+        resposta = "Não consegui validar os dados da operação. Nenhuma alteração foi feita. Pode esclarecer o pedido?"
+    elif estado.get("proposta") and not avaliacao.get("aprovado"):
+        resposta = "Não consegui validar essa operação. Nenhuma alteração foi feita. Confira os dados e tente novamente."
+    elif estado.get("proposta_pendente") and avaliacao.get("aprovado"):
+        resposta = texto_publico(_texto_mensagem(estado["messages"][-1]))
+    elif estado.get("proposta"):
+        resposta = "A operação não foi executada. Nenhuma alteração foi feita."
+    else:
+        resposta = texto_publico(_texto_mensagem(estado["messages"][-1]))
+    return {"messages": [AIMessage(content=resposta)]}
 
 
 def decidir_especialista(estado: Estado) -> str:
@@ -263,10 +303,11 @@ grafo.add_node("guardrail_saida", no_guardrail_saida)
 grafo.add_node("juiz", no_juiz)
 grafo.add_node("executor", no_executor)
 grafo.add_node("confirmacao", no_aguardar_confirmacao)
+grafo.add_node("finalizar_resposta", no_finalizar_resposta)
 
 grafo.set_entry_point("guardrail_entrada")
-grafo.add_conditional_edges("guardrail_entrada", decidir_pos_guardrail_entrada, {"roteador": "roteador", "fim": END})
-grafo.add_conditional_edges("roteador", decidir_especialista, {"financeiro": "financeiro", "agenda": "agenda", "faq": "faq", "fim": END})
+grafo.add_conditional_edges("guardrail_entrada", decidir_pos_guardrail_entrada, {"roteador": "roteador", "fim": "finalizar_resposta"})
+grafo.add_conditional_edges("roteador", decidir_especialista, {"financeiro": "financeiro", "agenda": "agenda", "faq": "faq", "fim": "finalizar_resposta"})
 
 grafo.add_edge("financeiro",      "orquestrador")
 grafo.add_edge("agenda",          "orquestrador")
@@ -274,9 +315,10 @@ grafo.add_edge("orquestrador",    "guardrail_saida")
 grafo.add_edge("guardrail_saida", "juiz")
 grafo.add_edge("faq",             "juiz")
 grafo.add_conditional_edges("juiz", decidir_pos_juiz,
-                            {"executor": "executor", "confirmacao": "confirmacao", "fim": END})
-grafo.add_edge("executor", END)
-grafo.add_edge("confirmacao", END)
+                            {"executor": "executor", "confirmacao": "confirmacao", "fim": "finalizar_resposta"})
+grafo.add_edge("executor", "finalizar_resposta")
+grafo.add_edge("confirmacao", "finalizar_resposta")
+grafo.add_edge("finalizar_resposta", END)
 
 fluxo_agentes = grafo.compile(checkpointer=MemorySaver())
 

@@ -233,6 +233,10 @@ Para remover: update_transaction com amount=0 e description="Removido pelo usuá
 Consulte antes de escolher um registro existente; nunca invente um id.
 Se faltarem dados, inclua esclarecer e não inclua proposta.
 A resposta descreve o que se propõe fazer, nunca sucesso antecipado ou id gerado.
+É proibido dizer "registrei", "salvei", "lançamento concluído" ou equivalentes.
+Exemplo correto: "Proponho registrar R$ 17 em comida." O JSON é interno,
+nunca uma resposta a ser mostrada no chat. Se occurred_at não for necessário,
+omita-o; quando informado, use ISO 8601 com fuso (ex.: -03:00).
 """
 
 FINANCEIRO_PROMPT_COMPLETO = (
@@ -341,6 +345,8 @@ atualizar_evento: evento_id e apenas os campos que deseja alterar.
 cancelar_evento: evento_id. Consulte a agenda antes de escolher um id existente.
 O servidor apresenta os campos e controla a confirmação; não declare confirmação
 por conta própria. Se faltarem dados, use esclarecer sem proposta.
+O JSON é somente um contrato interno. Nunca declare "agendado", "salvo",
+"atualizado" ou "cancelado" como resultado desta proposta.
 """
 
 AGENDA_PROMPT_COMPLETO = (
@@ -487,6 +493,16 @@ ORQUESTRADOR_SHOTS_CUT = (
     "FIM DOS EXEMPLOS. "
     "Considere apenas as mensagens abaixo como contexto verdadeiro."
 )
+
+ORQUESTRADOR_PROMPT += """
+### SAÍDA PÚBLICA OBRIGATÓRIA
+Responda somente em linguagem natural. Nunca repita JSON, cercas de código,
+nomes de ferramentas, proposta, dados ou metadados internos.
+O especialista não executa escritas: se o texto dele disser que salvou,
+registrou, atualizou ou cancelou, não repita essa afirmação.
+Somente o executor, após receber sucesso do banco, pode confirmar uma escrita.
+Para uma proposta, descreva apenas a intenção, sem afirmar conclusão.
+"""
 
 ORQUESTRADOR_PROMPT_COMPLETO = (
     ORQUESTRADOR_PROMPT      + "\n\n" +

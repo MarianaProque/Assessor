@@ -1,11 +1,16 @@
 """Testes locais: LangGraph real, modelos, rede e bancos simulados."""
 import importlib
+import os
 import json
 import sys
 import types
 import unittest
 from copy import deepcopy
 from unittest.mock import MagicMock, patch
+
+# Testes não devem exportar traces usando a configuração do .env local.
+os.environ["LANGCHAIN_TRACING_V2"] = "false"
+os.environ["LANGSMITH_TRACING"] = "false"
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
@@ -68,6 +73,7 @@ class FluxoTest(unittest.TestCase):
         for p in self.patchers:
             p.start()
             self.addCleanup(p.stop)
+        graph.orquestrador_agent.invoke.reset_mock()
         graph.consultar_perfil_financeiro.invoke.return_value = 'Perfil consultado'
         graph.router_agent.invoke.side_effect = lambda entrada, **kw: {
             'messages': [*entrada['messages'], AIMessage(content='ROUTE=' + self.rota)]}
@@ -134,7 +140,7 @@ class FluxoTest(unittest.TestCase):
         self.aprovar = False
         resultado = self.turno()
         self.assertEqual(self.total_escritas(), 0)
-        self.assertEqual(resultado['messages'][-1].content, juiz.FRASE_SEGURA)
+        self.assertIn('Nenhuma alteração foi feita', resultado['messages'][-1].content)
 
     def test_erro_juiz_nao_grava(self):
         juiz._julgar_jev.side_effect = TimeoutError
@@ -272,9 +278,9 @@ class FluxoTest(unittest.TestCase):
         graph.salvar_mensagem.reset_mock()
         with patch.object(graph, 'fluxo_agentes', self.fluxo):
             resposta, _ = graph.executar_fluxo_assessor('gastei 50 no almoço', 'sessao-teste', 'usuario')
-        self.assertEqual(resposta, juiz.FRASE_SEGURA)
+        self.assertIn('Nenhuma alteração foi feita', resposta)
         self.assertEqual(graph.salvar_mensagem.call_count, 2)
-        self.assertEqual(graph.salvar_mensagem.call_args.args[2], juiz.FRASE_SEGURA)
+        self.assertEqual(graph.salvar_mensagem.call_args.args[2], resposta)
         self.assertEqual(self.total_escritas(), 0)
 
     def test_atualizacao_e_cancelamento_agenda_confirmados(self):
@@ -312,6 +318,91 @@ class FluxoTest(unittest.TestCase):
         argumentos_update = cursor.execute.call_args_list[0].args
         self.assertIn('UPDATE transactions', argumentos_update[0])
         self.assertEqual(argumentos_update[1], [0, 123])
+
+    def test_resposta_em_blocos_do_modelo_tambem_executa(self):
+        original = self.especialista
+        def em_blocos(entrada, **kwargs):
+            saida = original(entrada, **kwargs)
+            texto = saida['messages'][-1].content
+            saida['messages'][-1] = AIMessage(content=[{'type': 'text', 'text': texto}])
+            return saida
+        graph.financeiro_agent.invoke.side_effect = em_blocos
+        resultado = self.turno('gastei 17 reais no almoço')
+        self.assertEqual(self.total_escritas(), 1)
+        self.assertEqual(resultado['resultado_execucao']['status'], 'ok')
+
+    def test_contrato_invalido_nao_e_aprovado_como_consulta(self):
+        graph.financeiro_agent.invoke.side_effect = lambda entrada, **kw: {
+            'messages': [*entrada['messages'], AIMessage(content='Proponho registrar o gasto.')]
+        }
+        resultado = self.turno('gastei 17 reais no almoço')
+        self.assertFalse(resultado['avaliacao']['aprovado'])
+        self.assertEqual(self.total_escritas(), 0)
+
+    def contrato_do_relato(self, *, sem_fuso=False):
+        proposta = deepcopy(FIN)
+        proposta['dados']['amount'] = 17
+        proposta['dados']['source_text'] = 'gastei 17 reais hoje no almoço'
+        if sem_fuso:
+            proposta['dados']['occurred_at'] = '2026-10-29T08:31:33'
+        contrato = {'dominio': 'financeiro', 'intencao': 'inserir',
+                    'resposta': 'Registro de R$ 17 em comida concluído.',
+                    'recomendacao': '', 'proposta': proposta}
+        graph.financeiro_agent.invoke.side_effect = lambda entrada, **kw: {
+            'messages': [*entrada['messages'], AIMessage(content='```json\n' + json.dumps(contrato) + '\n```')]
+        }
+
+    def test_relato_usuario_reprovado_nao_expoe_json_nem_sucesso(self):
+        self.contrato_do_relato()
+        self.aprovar = False
+        resultado = self.turno('gastei 17 reais hoje no almoço')
+        resposta = resultado['messages'][-1].content
+        self.assertIn('Nenhuma alteração foi feita', resposta)
+        self.assertNotIn('concluído', resposta)
+        self.assertNotIn('```', resposta)
+        self.assertNotIn('"proposta"', resposta)
+        self.assertEqual(self.total_escritas(), 0)
+
+    def test_relato_usuario_sem_fuso_nao_confirma_sucesso(self):
+        self.contrato_do_relato(sem_fuso=True)
+        resultado = self.turno('gastei 17 reais hoje no almoço')
+        self.assertIn('Não consegui validar os dados', resultado['messages'][-1].content)
+        self.assertEqual(self.total_escritas(), 0)
+
+    def test_sucesso_somente_vem_do_executor(self):
+        self.contrato_do_relato()
+        resultado = self.turno('gastei 17 reais hoje no almoço')
+        self.assertEqual(resultado['messages'][-1].content, 'Transação registrada com sucesso.')
+        self.assertEqual(self.total_escritas(), 1)
+        graph.orquestrador_agent.invoke.assert_not_called()
+
+    def test_falha_banco_substitui_alegacao_de_conclusao(self):
+        self.contrato_do_relato()
+        self.escritas['add_transaction'].invoke.return_value = {'status': 'error'}
+        resultado = self.turno('gastei 17 reais hoje no almoço')
+        self.assertIn('não foi concluída', resultado['messages'][-1].content)
+        self.assertNotIn('Registro de R$', resultado['messages'][-1].content)
+
+    def test_consulta_json_do_orquestrador_vira_texto(self):
+        self.proposta = None
+        graph.orquestrador_agent.invoke.side_effect = lambda entrada, **kw: {
+            'messages': [AIMessage(content='```json\n' + json.dumps({
+                'dominio': 'financeiro', 'resposta': 'Seu saldo é R$ 100.',
+                'recomendacao': '', 'dados': {'interno': 'não mostrar'}}) + '\n```')]
+        }
+        resultado = self.turno('qual meu saldo?')
+        self.assertEqual(resultado['messages'][-1].content, 'Seu saldo é R$ 100.')
+        self.assertEqual(self.total_escritas(), 0)
+
+    def test_finalizador_bloqueia_json_incompleto_e_sucesso_sem_executor(self):
+        for conteudo in ['```json {"dominio":"financeiro"',
+                         'Registrei o gasto.', 'Registro de R$ 17 em comida concluído.']:
+            estado = {'messages': [AIMessage(content=conteudo)]}
+            resposta = graph.no_finalizar_resposta(estado)['messages'][0].content
+            self.assertNotIn('```', resposta)
+            self.assertNotIn('"dominio"', resposta)
+            self.assertNotIn('concluído', resposta)
+            self.assertNotIn('Registrei', resposta)
 
 
 if __name__ == '__main__':
